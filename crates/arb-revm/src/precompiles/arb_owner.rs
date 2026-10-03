@@ -789,6 +789,12 @@ where
                 "setMaxStylusContractFragments"
             )
         }
+        // Nitro v3.12 precompiles/ArbOwner.go SetWasmActivationGas: one write of the programs
+        // activation-gas slot, which ArbWasm.activateProgram already reads (ArbOS >= 59).
+        ArbOwner::ArbOwnerCalls::setWasmActivationGas(c) => set_or_revert!(
+            state.programs.activation_gas.set(c.gas, j),
+            "setWasmActivationGas"
+        ),
     };
 
     // Nitro wraps every successful, state-mutating ArbOwner method with an `OwnerActs` event
