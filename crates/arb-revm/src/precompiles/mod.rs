@@ -725,6 +725,9 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             {
                 return (50, 0);
             }
+            if sel == ArbOwner::setWasmActivationGasCall::SELECTOR {
+                return (59, 0);
+            }
             if sel == ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR
                 || sel == ArbOwner::addTransactionFiltererCall::SELECTOR
                 || sel == ArbOwner::removeTransactionFiltererCall::SELECTOR
@@ -950,6 +953,15 @@ mod gating_tests {
         assert_eq!(
             method_arbos_bounds(E::ArbOwner, ArbOwner::setGasBacklogCall::SELECTOR),
             (50, 0)
+        );
+        // v59 ArbOwner setter (Nitro v3.12 SetWasmActivationGas); selector 0xa0a32497
+        assert_eq!(
+            ArbOwner::setWasmActivationGasCall::SELECTOR,
+            [0xa0, 0xa3, 0x24, 0x97]
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwner, ArbOwner::setWasmActivationGasCall::SELECTOR),
+            (59, 0)
         );
         // not gated
         assert_eq!(
