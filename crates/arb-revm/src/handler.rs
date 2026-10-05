@@ -605,6 +605,7 @@ where
         // A filtered transaction consumes all gas without executing or mutating its authorities.
         if is_filtered_post_start_tx(evm) {
             evm.ctx_mut().chain_mut().filtered_tx = true;
+            self.bump_filtered_create_nonce(evm)?;
             return Ok(Some(PreExecutionOutput {
                 eip7702_refund: 0,
                 checkpoint: evm.ctx_mut().journal_mut().checkpoint(),
@@ -678,6 +679,7 @@ where
             // checks the retry envelope hash, consumes the remaining gas, and lets EndTxHook
             // restore the escrow because the retry failed.
             if is_filtered_post_start_tx(evm) {
+                self.bump_filtered_create_nonce(evm)?;
                 evm.ctx_mut().journal_mut().checkpoint_commit();
                 return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
@@ -1133,6 +1135,28 @@ where
     ERROR: EvmTrError<EVM> + FromStringError,
     FRAME: FrameTr<FrameResult = FrameResult, FrameInit = FrameInit>,
 {
+    /// Bumps the sender nonce of a filtered contract creation.
+    ///
+    /// Nitro's `RevertedTxHook` increments the sender nonce of a filtered transaction whatever
+    /// it is (`SetNonce(From, GetNonce(From)+1)`, tx_processor.go) and then skips the EVM. A
+    /// call's nonce has been bumped by the time the filter is consulted
+    /// (`validate_against_state_and_deduct_caller`, or the retry pre-execution hook). A
+    /// creation's is left to revm's CREATE frame, which a filtered transaction never reaches,
+    /// so without this its sender keeps its nonce and the state root diverges (robinhood
+    /// 80697737: a filtered `ArbitrumContractTx` creation, sender nonce 1 on canonical).
+    fn bump_filtered_create_nonce(&self, evm: &mut EVM) -> Result<(), ERROR> {
+        if evm.ctx().tx().kind().is_call() {
+            return Ok(());
+        }
+        let caller = evm.ctx().tx().caller();
+        let journal = evm.ctx_mut().journal_mut();
+        journal
+            .load_account_with_code_mut(caller)?
+            .data
+            .bump_nonce();
+        Ok(())
+    }
+
     /// EndTxHook for `ArbitrumRetryTx`.
     ///
     /// Mirrors Nitro's tx_processor.go EndTxHook retry branch (lines 589-720).
@@ -1433,6 +1457,7 @@ where
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
             if is_filtered_post_start_tx(evm) {
+                self.bump_filtered_create_nonce(evm)?;
                 evm.ctx_mut().journal_mut().checkpoint_commit();
                 return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
@@ -1485,8 +1510,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
-        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, BATCH_POSTER_ADDRESS, JournalTr, retry_fee_refund,
+        ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
+        ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, BATCH_POSTER_ADDRESS, JournalTr,
+        retry_fee_refund,
     };
     use crate::{
         ArbBuilder, ArbChainContext, ArbSpecId, ArbTransaction,
@@ -2208,6 +2234,65 @@ mod tests {
             1,
             "Nitro's RevertedTxHook increments the sender nonce"
         );
+    }
+
+    /// Robinhood block 80,697,737: a filtered `ArbitrumContractTx` contract creation left its
+    /// sender at nonce 0 where canonical has 1. Nitro's `RevertedTxHook` bumps the sender nonce
+    /// whatever the transaction is; revm bumps a creation's in the CREATE frame, which a
+    /// filtered transaction never reaches.
+    #[test]
+    fn filtered_contract_creation_still_bumps_the_sender_nonce() {
+        for tx_type in [0x02, ARBITRUM_CONTRACT_TX_TYPE] {
+            let caller = Address::with_last_byte(0x3c);
+            let encoded = revm::primitives::bytes!("02c1");
+            let mut db = InMemoryDB::default();
+            seed_transaction_filter(
+                &mut db,
+                keccak256(encoded.as_ref()),
+                Address::with_last_byte(0x3a),
+                Address::with_last_byte(0x3b),
+            );
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance: U256::from(1_000_000_u64),
+                    ..Default::default()
+                },
+            );
+            let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+                .with_chain_id(42161)
+                .with_disable_priority_fee_check(true);
+            let ctx = Context::mainnet()
+                .with_tx(ArbTransaction::<TxEnv>::default())
+                .with_cfg(cfg)
+                .with_chain(ArbChainContext::default())
+                .with_db(db);
+            let mut evm = ctx.build_arb();
+
+            let mut tx = make_call_tx(tx_type, caller, Address::ZERO);
+            tx.base.kind = TxKind::Create;
+            // PUSH0 PUSH0 RETURN: an empty contract, were it run.
+            tx.base.data = revm::primitives::bytes!("5f5ff3");
+            let out = evm
+                .transact(tx.with_encoded_2718(encoded))
+                .expect("filtered creation must be included as a failed receipt");
+
+            assert!(!out.result.is_success(), "filtered receipt must fail");
+            assert_eq!(out.result.tx_gas_used(), 100_000);
+            assert_eq!(
+                out.state
+                    .get(&caller)
+                    .expect("caller nonce update is retained")
+                    .info
+                    .nonce,
+                1,
+                "a filtered creation of type {tx_type:#x} bumps the sender nonce once"
+            );
+            assert!(
+                !out.state.contains_key(&caller.create(0)),
+                "a filtered creation deploys nothing"
+            );
+        }
     }
 
     #[test]
@@ -3011,6 +3096,64 @@ mod tests {
                 .info
                 .nonce,
             1
+        );
+    }
+
+    /// A filtered retry of a contract-creation retryable (`retryTo` nil). The retry
+    /// pre-execution hook leaves a creation's nonce to the CREATE frame, which a filtered retry
+    /// never reaches; Nitro's `RevertedTxHook` bumps it all the same.
+    #[test]
+    fn filtered_creation_retry_still_bumps_the_sender_nonce() {
+        let caller = Address::with_last_byte(0xb1);
+        let ticket_id = B256::with_last_byte(0xb2);
+        let encoded = revm::primitives::bytes!("68c1");
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            keccak256(encoded.as_ref()),
+            Address::with_last_byte(0xb3),
+            Address::with_last_byte(0xb4),
+        );
+
+        let state = ArbosState::open();
+        let retryable = state.retryables.retryable(ticket_id);
+        let (_, timeout_slot) = retryable.timeout.account_and_key();
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            U256::from_be_bytes(timeout_slot.0),
+            U256::from(1_u64),
+        )
+        .expect("should seed retryable timeout");
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+        let mut evm = ctx.build_arb();
+
+        let mut tx = make_retry_tx(caller, Address::ZERO, ticket_id, U256::ZERO, 100_000);
+        tx.base.kind = TxKind::Create;
+        tx.base.data = revm::primitives::bytes!("5f5ff3");
+        let out = evm
+            .transact(tx.with_encoded_2718(encoded))
+            .expect("filtered creation retry must be included as a failed receipt");
+
+        assert!(!out.result.is_success(), "filtered retry receipt must fail");
+        assert_eq!(out.result.tx_gas_used(), 100_000);
+        assert_eq!(
+            out.state
+                .get(&caller)
+                .expect("retry sender nonce update is retained")
+                .info
+                .nonce,
+            1
+        );
+        assert!(
+            !out.state.contains_key(&caller.create(0)),
+            "a filtered creation retry deploys nothing"
         );
     }
 
